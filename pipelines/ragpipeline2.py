@@ -2,6 +2,9 @@ import json
 import time
 import hashlib
 import re
+import os
+from dotenv import load_dotenv
+from pydantic import BaseModel
 # from numpy import dot
 import numpy as np
 from numpy.linalg import norm
@@ -15,14 +18,19 @@ from pinecone import ServerlessSpec
 import subprocess
 import threading
 import queue
+import openai
+
+# Load environment variables
+load_dotenv()
+
 # Constants
-INDEX_NAME = "eidos-data"
+INDEX_NAME = os.getenv("INDEX_NAME", "eidos-data")
 NEWSPIECE = "What does a post-AGI world look like?"
-DIMENSION = 1536
-METRIC = "cosine"
-NAMESPACE_SENTENCES = "sentences"
-NAMESPACE_CONVERSATIONS = "conversations"
-OUTPUT_FOLDER = "newconversations"
+DIMENSION = int(os.getenv("DIMENSION", "1536"))
+METRIC = os.getenv("METRIC", "cosine")
+NAMESPACE_SENTENCES = os.getenv("NAMESPACE_SENTENCES", "sentences")
+NAMESPACE_CONVERSATIONS = os.getenv("NAMESPACE_CONVERSATIONS", "conversations")
+OUTPUT_FOLDER = os.getenv("OUTPUT_FOLDER", "newconversations")
 # change the function
 USER_INPUT_SEARCH_FUNCTION='query_sentences'
 NAME_POOL =  [ "Porfirio Bourke",
@@ -56,12 +64,15 @@ NAME_POOL =  [ "Porfirio Bourke",
 'Ahmed Yamamoto', 'Maya Lopez', 'Noah Kowalski', 'Elif Yamamoto', 'Yuki Silva', 
 'Jade Patel', 'Liam Dubois', 'Zoe Chavez', 'Niko Gonzalez', 'Yuki Pereira'  ]
 
+class GetExpertQuote(BaseModel):
+    pass  # Empty class definition for now
+
 tools = [
   {
       "type": "function",
       "function": {
           "name": "query_sentences",
-          "description": "Find relevant responses from other users. Call this when the user expresses a strong opinion about anything.",
+          "description": "Find relevant responses from other users. Call this when the user expresses an opinion and having other users' views would be useful.",
           "parameters": {
               "type": "object",
               "properties": {
@@ -70,14 +81,16 @@ tools = [
               },
           },
       },
-  }
+  },
+  openai.pydantic_function_tool(GetExpertQuote)
 ]
+
 
 # key is called OPENAI_API_KEY and PINECONE_KEY
 
 # OpenAI and Pinecone setup
-openai_client = OpenAI(api_key="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")
-pinecone_client = Pinecone(api_key= "pcsk_7GAtT7_7AJ56em5YmDRe62cXiXBstGYmtuD4R5qfSd6GZRiKiVnqaNUbhdYQvvQ9gjUxHK")
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+pinecone_client = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 
 if not pinecone_client.has_index(INDEX_NAME):
     pinecone_client.create_index(
@@ -230,14 +243,19 @@ def query_sentences(query, session_set, top_k=3, block_k=3):
         print(f"Error querying sentences: {e}")
         return []
 
-def call_llm(finetuned_model: str, conversation_history):
+def call_llm(model: str, conversation_history):
     # prompt = f"Generate a follow-up question based on this context: \"{context}\"."
     try:
-        response = openai_client.chat.completions.create(
-            model=finetuned_model,
-            messages=conversation_history,
-            tools=tools
-        )
+        if (model == "gpt-4o"):
+            response = openai_client.chat.completions.create(
+                model=model,
+                messages=conversation_history,
+                tools=tools)
+        else :
+            response = openai_client.chat.completions.create(
+                model=model,
+                messages=conversation_history,
+            )
         return response.choices[0].message
     except Exception as e:
         print(f"Error generating question: {e}")
@@ -305,10 +323,12 @@ def run_chat(finetuned_model):
     # system_prompt = "Have you ever had a near-death experience?"
     # print(system_prompt)
     session = {"messages": []}
+    # first_msg = call_llm(finetuned_model, None)
     conversation_history = [
-        {"role": "system", "content": f"You are a curious think partner. Your job is to get the user to say interesting things. Be a jouralist/news operator interviewing the user. You are embedded in the backend of a social media news app. You're exploring the question {NEWSPIECE}. Your job is to ask users questions and engage them. Add to the discussion by succintly giving other users' responses by calling the {USER_INPUT_SEARCH_FUNCTION}. If the user says something that is verifiably infactual, then challenge them."},
-        {"role": "assistant", "content": "Hello"}
+        {"role": "system", "content": f"You are a journalist. Your job is to get the user to say interesting things. Act like a jouralist/news operator interviewing the user. You're exploring the question {NEWSPIECE}. Your job is to ask users questions and engage them. Add to the discussion by succintly giving other users' responses by calling the {USER_INPUT_SEARCH_FUNCTION}. If the user says something that is verifiably infactual, then challenge them."}
     ]
+    first_msg = call_llm(finetuned_model, conversation_history)
+    conversation_history.append({"role": "assistant", "content": first_msg.content})
     session_set = set()
 
     while True:
@@ -324,14 +344,11 @@ def run_chat(finetuned_model):
         session_set.update(re.split(r'(?<=[.!?]) +', user_input))
 
         conversation_history.append({"role": "user", "content": user_input})
+        check = call_llm("gpt-4o", conversation_history)
+        search_flag = check.function_call or check.tool_calls
         response = call_llm(finetuned_model, conversation_history)
-        # print(conversation_history)
-        # print(response)
-        # print(f"RESPONSE TO CALL_LLM: {response}")
         follow_up_question = response.content
-        # print(f"FOLLOW UP QUESTION {follow_up_question}")
-        # print(f"ARGUMENTS: {response.tool_calls[0].function.arguments['query']}")
-        search_flag = response.function_call or response.tool_calls
+        
 
 
         if search_flag:
@@ -349,22 +366,16 @@ def run_chat(finetuned_model):
                 "tool_call_id": response.tool_calls[0].id
             }
 
-            print(sentence)
-            
             cache = conversation_history
-            cache[0] = {"role": "system", "content": f"You are a journalist/reporter. You want to take the conversation in this turn: {query} Drive the conversation in 2-3 sentences by contextualizing, and challenging or supporting the user through something interesting in response to the last user input. Do it in a coherent way and weave only parts of this passage: '{sentence}' by quoting verbatim and saying 'another used said: ' anytime you do it. You're trying to push into the direction {query}"}
+            cache[0] = {"role": "system", "content": f"You are a journalist/reporter embedded into a social media's backend. You want to take the conversation in this turn: '{query}'. Based on this, answer in 2-3 sentences by contextualizing, and challenging or supporting the user through something interesting in response to the last user input. Do it in a coherent way and weave only parts of this passage if you think it'll add to your argument: '{sentence}'. If you do, do it by quoting verbatim and saying 'another used said: ' anytime you do it."}
             cache.append(response)
             cache.append(function_call_result_message)
-
-            print(cache)
-
             # Call the OpenAI API's chat completions endpoint to send the tool call result back to the model
 
             response = openai_client.chat.completions.create(
-                model=finetuned_model,
+                model="gpt-4o-mini",
                 messages=cache
             )
-            print("searched")
             print(f"System: {response.choices[0].message.content}")
 
             session["messages"].append({"role": "assistant", "content": response.choices[0].message.content})
@@ -451,7 +462,8 @@ def run_chat(finetuned_model):
 
 # Main Execution
 if __name__ == "__main__":
-    finetuned_model = "ft:gpt-4o-mini-2024-07-18:eidos:weighted-5:AY6pwwuw"
+    # finetuned_model = "ft:gpt-4o-mini-2024-07-18:eidos:weighted-5:AY6pwwuw"
+    finetuned_model = "ft:gpt-4o-mini-2024-07-18:eidos:onweighted4:AfLWLcNw"
     # finetuned_model = "ft:gpt-4o-mini-2024-07-18:eidos:finetuningonfinetuningonweighted3:AY6knjju"
     # print("running")
     print("i am running right now!")
